@@ -1,0 +1,8 @@
+streamlit>=1.32
+pandas>=2.0
+pip install av
+pip install deepface
+pip install streamlit-autorefresh
+pip install streamlit-webrtc
+pip install opencv-python
+pip install tf-keras
