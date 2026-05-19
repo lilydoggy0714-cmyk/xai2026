@@ -1,3 +1,29 @@
+# =========================
+# Fix asyncio WebRTC close error
+# =========================
+import asyncio
+import logging
+
+logging.getLogger("aioice").setLevel(logging.CRITICAL)
+logging.getLogger("aiortc").setLevel(logging.CRITICAL)
+logging.getLogger("streamlit_webrtc").setLevel(logging.ERROR)
+
+try:
+    from asyncio import selector_events
+
+    _old_fatal_error = selector_events._SelectorTransport._fatal_error
+
+    def _safe_fatal_error(self, exc, message="Fatal error on transport"):
+        # 避免 WebRTC 關閉後 self._loop 已經變 None 又呼叫 call_exception_handler
+        if getattr(self, "_loop", None) is None:
+            return
+        return _old_fatal_error(self, exc, message)
+
+    selector_events._SelectorTransport._fatal_error = _safe_fatal_error
+
+except Exception:
+    pass
+    
 import requests
 import ast
 import hashlib
