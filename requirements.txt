@@ -4,5 +4,5 @@ av
 streamlit-autorefresh
 streamlit-webrtc
 opencv-python-headless
-tf-keras
-deepface
+--only-binary :all: tf-keras
+--only-binary :all: deepface
