@@ -74,6 +74,110 @@ ADMIN_CODE = os.environ.get("XAI_ADMIN_CODE", "teacher-demo")
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "https://script.google.com/macros/s/AKfycbycczwACCLax8hs5Qej17F-yP7vqdXrdA-nFRYmdS8vAw7RpXayrAD6u49qKW2H1J2U/exec")
 APPS_SCRIPT_TOKEN = os.environ.get("APPS_SCRIPT_TOKEN", "xai-2026")
 
+def get_rtc_configuration():
+    """
+    Streamlit Community Cloud / 本機皆可用的 WebRTC ICE 設定。
+
+    - 本機或一般網路：先使用 Google STUN。
+    - Streamlit Community Cloud 若鏡頭開不起來：建議在 Secrets 加入
+      TWILIO_ACCOUNT_SID 與 TWILIO_AUTH_TOKEN，本函式會自動向 Twilio
+      取得短效 STUN/TURN ice_servers。
+    """
+    fallback_config = {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]}
+        ]
+    }
+
+    # 先嘗試從 Twilio 取得短效 TURN 憑證
+    try:
+        account_sid = None
+        auth_token = None
+
+        try:
+            account_sid = st.secrets.get("TWILIO_ACCOUNT_SID", None)
+            auth_token = st.secrets.get("TWILIO_AUTH_TOKEN", None)
+        except Exception:
+            pass
+
+        account_sid = account_sid or os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = auth_token or os.getenv("TWILIO_AUTH_TOKEN")
+
+        if account_sid and auth_token:
+            url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Tokens.json"
+            response = requests.post(
+                url,
+                auth=(account_sid, auth_token),
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+            ice_servers = data.get("ice_servers", [])
+
+            if ice_servers:
+                return {"iceServers": ice_servers}
+
+    except Exception as e:
+        # Cloud 上若 Twilio 暫時失敗，不中斷主流程，改用 STUN。
+        try:
+            st.warning(f"Twilio TURN 取得失敗，目前改用 STUN：{e}")
+        except Exception:
+            print(f"[Twilio TURN failed] {e}")
+
+    # 也支援手動 TURN_URL / TURN_USERNAME / TURN_PASSWORD
+    try:
+        turn_url = None
+        turn_username = None
+        turn_password = None
+
+        try:
+            turn_url = st.secrets.get("TURN_URL", None)
+            turn_username = st.secrets.get("TURN_USERNAME", None)
+            turn_password = st.secrets.get("TURN_PASSWORD", None)
+        except Exception:
+            pass
+
+        turn_url = turn_url or os.getenv("TURN_URL")
+        turn_username = turn_username or os.getenv("TURN_USERNAME")
+        turn_password = turn_password or os.getenv("TURN_PASSWORD")
+
+        if turn_url and turn_username and turn_password:
+            return {
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]},
+                    {
+                        "urls": [turn_url],
+                        "username": turn_username,
+                        "credential": turn_password,
+                    },
+                ]
+            }
+    except Exception:
+        pass
+
+    return fallback_config
+
+
+def render_rtc_diagnostics(rtc_config: dict):
+    """顯示 ICE 狀態，但不顯示 TURN 密碼。"""
+    servers = rtc_config.get("iceServers", [])
+    has_turn = any(
+        str(url).startswith("turn:")
+        for server in servers
+        for url in (
+            server.get("urls", [])
+            if isinstance(server.get("urls", []), list)
+            else [server.get("urls", "")]
+        )
+    )
+
+    if has_turn:
+        st.success("WebRTC 已啟用 TURN/STUN 設定，較適合 Streamlit Community Cloud。")
+    else:
+        st.info("目前只使用 STUN。若 Streamlit Community Cloud 鏡頭開不了，請在 Secrets 設定 TWILIO_ACCOUNT_SID 與 TWILIO_AUTH_TOKEN。")
+
+
+
 EMOTION_RECORD_COLUMNS = [
     "timestamp",
     "session_id",
@@ -319,10 +423,19 @@ def render_header(config):
 
 
 class EmotionVideoProcessor(VideoProcessorBase):
+    """
+    WebRTC 影像處理器。
+
+    這裡只負責：
+    1. 接收瀏覽器 webcam 畫面
+    2. 暫存 latest_frame 給 render_emotion_detection_live_panel 每 3 秒分析
+    3. 在畫面上顯示狀態文字
+
+    注意：不要在每一幀都跑 DeepFace，否則 Cloud 上很容易卡住或斷線。
+    """
     def __init__(self):
-        self.last_analyze_time = 0
-        self.last_emotion = "尚未偵測"
-        self.emotion_window = deque(maxlen=5)
+        self.latest_frame = None
+        self.last_frame_time = 0.0
 
     def recv(self, frame):
         try:
@@ -331,41 +444,17 @@ class EmotionVideoProcessor(VideoProcessorBase):
             if cv2 is not None:
                 img = cv2.flip(img, 1)
 
-            now = time.time()
-
-            # 每 3 秒才做一次 DeepFace，避免每一幀分析造成 WebRTC 崩潰
-            if DeepFace is not None and now - self.last_analyze_time >= 3:
-                self.last_analyze_time = now
-
-                try:
-                    result = DeepFace.analyze(
-                        img,
-                        actions=["emotion"],
-                        enforce_detection=False,
-                        detector_backend="opencv",
-                        silent=True,
-                    )
-
-                    if isinstance(result, list):
-                        result = result[0]
-
-                    emotion = result.get("dominant_emotion", "unknown")
-                    self.emotion_window.append(emotion)
-
-                    # 簡單平滑，避免情緒跳動太快
-                    if len(self.emotion_window) > 0:
-                        self.last_emotion = Counter(self.emotion_window).most_common(1)[0][0]
-
-                except Exception:
-                    self.last_emotion = "偵測失敗"
+            # 存一份乾淨畫面給外層每 3 秒分析
+            self.latest_frame = img.copy()
+            self.last_frame_time = time.time()
 
             if cv2 is not None:
                 cv2.putText(
                     img,
-                    f"Emotion: {self.last_emotion}",
+                    "Webcam OK - emotion logs every 3 sec",
                     (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
+                    0.8,
                     (0, 255, 0),
                     2,
                 )
@@ -373,9 +462,13 @@ class EmotionVideoProcessor(VideoProcessorBase):
             return av.VideoFrame.from_ndarray(img, format="bgr24")
 
         except Exception:
-            # 這裡一定要保護，避免 recv() 例外直接炸掉 WebRTC
-            img = frame.to_ndarray(format="bgr24")
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
+            # 避免單一 frame 錯誤造成 WebRTC thread 中斷
+            try:
+                img = frame.to_ndarray(format="bgr24")
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
+            except Exception:
+                return frame
+
 
 def save_uploaded_image(upload, prefix: str) -> str:
     if upload is None:
@@ -556,7 +649,7 @@ def render_emotion_detection_live_panel(webrtc_ctx):
             st.error("目前環境缺少 DeepFace，無法開始情緒偵測。")
         elif webrtc_ctx is None:
             st.error("webcam 模組不可用。請確認已安裝 streamlit-webrtc 與 av。")
-        elif not webrtc_ctx.state.playing:
+        elif not getattr(getattr(webrtc_ctx, "state", None), "playing", False):
             st.info("請先允許瀏覽器使用內建相機，啟動 webcam 後才會開始記錄。")
         else:
             processor = getattr(webrtc_ctx, "video_processor", None)
@@ -595,6 +688,7 @@ def render_task_video_emotion_monitor():
             st.session_state["last_emotion_capture_at"] = 0.0
             log_event("emotion_detection_started", source="webcam")
             st.rerun()
+
     with btn2:
         if st.button("停止偵測", key="stop_task_emotion_detection"):
             st.session_state["emotion_detecting"] = False
@@ -603,25 +697,47 @@ def render_task_video_emotion_monitor():
 
     st.markdown("#### webcam 拍攝框")
     webrtc_ctx = None
+
     if webrtc_streamer is not None and WebRtcMode is not None and av is not None:
+        rtc_config = get_rtc_configuration()
+        render_rtc_diagnostics(rtc_config)
+
+        # key 必須穩定但不要太容易和其他學生/週次衝突
+        webrtc_key = (
+            f"task_emotion_webrtc_"
+            f"{st.session_state.get('week', 'unknown')}_"
+            f"{st.session_state.get('session_id', 'session')}"
+        )
+
         webrtc_ctx = webrtc_streamer(
-            key=f"task_emotion_webrtc_{st.session_state.get('week')}",
+            key=webrtc_key,
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-            media_stream_constraints={"video": True, "audio": False},
+            rtc_configuration=rtc_config,
+            media_stream_constraints={
+                "video": True,
+                "audio": False,
+            },
             video_processor_factory=EmotionVideoProcessor,
             async_processing=True,
         )
+
     else:
-        st.warning("目前環境未安裝 streamlit-webrtc / av，無法直接使用瀏覽器內建 webcam。可改用下方影片上傳。")
+        st.warning(
+            "目前環境未安裝 streamlit-webrtc / av，無法直接使用瀏覽器內建 webcam。"
+            "可改用下方影片上傳。"
+        )
 
     uploaded_video = st.file_uploader(
         "若無攝影機，可上傳 任務操作情緒記錄 影片",
         type=["mp4", "mov", "avi", "mkv", "mpeg"],
         key="task_video_uploader",
     )
+
     if uploaded_video is not None:
-        video_path = save_uploaded_video(uploaded_video, f"task_video_w{st.session_state.get('week')}")
+        video_path = save_uploaded_video(
+            uploaded_video,
+            f"task_video_w{st.session_state.get('week', 'unknown')}"
+        )
         st.session_state["emotion_uploaded_video_path"] = video_path
         st.video(video_path)
 
@@ -634,7 +750,11 @@ def render_task_video_emotion_monitor():
             except Exception as e:
                 st.error(f"影片分析失敗：{e}")
 
-    render_emotion_detection_live_panel(webrtc_ctx)
+    if webrtc_ctx is not None:
+        render_emotion_detection_live_panel(webrtc_ctx)
+    else:
+        st.info("目前沒有可用的 webcam 連線，請使用影片上傳方式。")
+
 
 def render_emotion_capture(title: str, store_prefix: str, week_cfg: dict):
     st.markdown(f"### {title}")
@@ -774,16 +894,19 @@ def render_login(config):
 
 def render_admin():
     st.success("管理端")
+
     if RESPONSES_CSV.exists():
         df = pd.read_csv(RESPONSES_CSV)
         st.metric("回應筆數", len(df))
         st.dataframe(df.tail(20), use_container_width=True)
         st.download_button("下載 responses.csv", RESPONSES_CSV.read_bytes(), "responses.csv", "text/csv")
+
     if EVENTS_CSV.exists():
         df = pd.read_csv(EVENTS_CSV)
         st.metric("事件筆數", len(df))
         st.dataframe(df.tail(20), use_container_width=True)
         st.download_button("下載 events.csv", EVENTS_CSV.read_bytes(), "events.csv", "text/csv")
+
     if EMOTION_CSV.exists():
         df = pd.read_csv(EMOTION_CSV, on_bad_lines="skip")
         for c in EMOTION_RECORD_COLUMNS:
@@ -792,21 +915,28 @@ def render_admin():
         df = df[EMOTION_RECORD_COLUMNS]
         st.metric("情緒紀錄筆數", len(df))
         st.dataframe(df.tail(20), use_container_width=True)
-        st.download_button("下載 emotion_records.csv", df.to_csv(index=False, encoding="utf-8-sig"), "emotion_records.csv", "text/csv")
+        st.download_button(
+            "下載 emotion_records.csv",
+            df.to_csv(index=False, encoding="utf-8-sig"),
+            "emotion_records.csv",
+            "text/csv",
+        )
+
     if st.button("測試同步到 Google Sheet"):
         test_row = {
-        "timestamp": utc_now_iso(),
-        "student_id": "admin_test",
-        "session_id": st.session_state.get("session_id", ""),
-        "message": "這是 Streamlit 管理端同步測試",
-    }
+            "timestamp": utc_now_iso(),
+            "student_id": "admin_test",
+            "session_id": st.session_state.get("session_id", ""),
+            "message": "這是 Streamlit 管理端同步測試",
+        }
 
-    ok = sync_to_apps_script("responses", test_row)
+        ok = sync_to_apps_script("responses", test_row)
 
-    if ok:
-        st.success("同步成功，請到 Google Sheet 的 responses 工作表確認。")
-    else:
-        st.error("同步失敗，請檢查 Apps Script URL、Token 或部署權限。")
+        if ok:
+            st.success("同步成功，請到 Google Sheet 的 responses 工作表確認。")
+        else:
+            st.error("同步失敗，請檢查 Apps Script URL、Token 或部署權限。")
+
 
 def render_intro(config):
     week_cfg = get_week_cfg(config)
